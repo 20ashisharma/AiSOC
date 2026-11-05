@@ -90,6 +90,8 @@ class AlertResponse(BaseModel):
     affected_hosts: list
     affected_users: list
     case_id: uuid.UUID | None
+    incident_id: uuid.UUID | None = None
+    fusion_decision: str | None = None
     tags: list
     event_time: datetime
     first_seen: datetime

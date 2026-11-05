@@ -52,7 +52,7 @@ _WINDOW_TO_TIMEDELTA: dict[str, timedelta] = {
 
 @router.get("/{case_id}/attack-chain")
 async def get_attack_chain(
-    case_id: uuid.UUID,
+    case_id: str,
     db: DBSession,
     user: AuthUser,
     window: WindowLiteral = Query(default="24h"),
@@ -68,17 +68,46 @@ async def get_attack_chain(
         # but a future schema change could relax that — fail closed.
         raise HTTPException(status_code=400, detail=f"unknown window: {window}")
 
-    case_row = (await db.execute(select(Case).where(Case.id == case_id, Case.tenant_id == user.tenant_id))).scalar_one_or_none()
-    if case_row is None:
-        raise HTTPException(status_code=404, detail="case_not_found")
+    try:
+        resolved_uuid = uuid.UUID(str(case_id))
+    except ValueError:
+        row = (
+            await db.execute(
+                text("SELECT id FROM aisoc_cases WHERE tenant_id = :tenant_id AND case_number = :case_number ORDER BY created_at DESC LIMIT 1").bindparams(
+                    tenant_id=user.tenant_id, case_number=case_id
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="case_not_found")
+        resolved_uuid = row
+
+    # Look up in aisoc_cases first (the canonical cases table)
+    raw_row = (
+        await db.execute(
+            text("SELECT id, tenant_id, alert_ids FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id").bindparams(
+                id=resolved_uuid, tenant_id=user.tenant_id
+            )
+        )
+    ).mappings().first()
+
+    alert_ids: list[Any] = []
+    if raw_row is not None:
+        alert_ids = raw_row.get("alert_ids") or []
+    else:
+        # Fallback to legacy cases table
+        case_row = (await db.execute(select(Case).where(Case.id == resolved_uuid, Case.tenant_id == user.tenant_id))).scalar_one_or_none()
+        if case_row is None:
+            raise HTTPException(status_code=404, detail="case_not_found")
+        alert_ids = case_row.alert_ids or []
 
     # Pick the seed alert: earliest event_time linked to the case. We
     # prefer ``case.alert_ids`` (denormalised) but fall back to a probe
     # on ``alerts.case_id`` if that list is empty so a freshly-linked
     # case still resolves.
     seed_alert_id: uuid.UUID | None = None
-    if case_row.alert_ids:
-        candidate_ids = [uuid.UUID(str(a)) if not isinstance(a, uuid.UUID) else a for a in case_row.alert_ids]
+    if alert_ids:
+        candidate_ids = [uuid.UUID(str(a)) if not isinstance(a, uuid.UUID) else a for a in alert_ids]
         seed_row = (
             await db.execute(
                 select(Alert)
@@ -98,7 +127,7 @@ async def get_attack_chain(
             await db.execute(
                 select(Alert)
                 .where(
-                    Alert.case_id == case_id,
+                    Alert.case_id == resolved_uuid,
                     Alert.tenant_id == user.tenant_id,
                 )
                 .order_by(Alert.event_time.asc())
@@ -110,7 +139,7 @@ async def get_attack_chain(
 
     if seed_alert_id is None:
         return {
-            "case_id": str(case_id),
+            "case_id": str(resolved_uuid),
             "tenant_id": str(user.tenant_id),
             "window": window,
             "seed_alert_id": None,
@@ -160,7 +189,7 @@ async def get_attack_chain(
             {
                 "tenant_id": str(user.tenant_id),
                 "seed_alert_id": str(chain.seed_alert_id),
-                "case_id": str(case_id),
+                "case_id": str(resolved_uuid),
                 "window": window,
                 "chain": _json_dumps([link.to_dict() for link in chain.chain]),
                 "entity_graph": _json_dumps(chain.entity_graph),
@@ -176,7 +205,7 @@ async def get_attack_chain(
         logger.debug("attack_chain cache write skipped: %s", exc)
 
     payload = chain.to_dict()
-    payload["case_id"] = str(case_id)
+    payload["case_id"] = str(resolved_uuid)
     return payload
 
 

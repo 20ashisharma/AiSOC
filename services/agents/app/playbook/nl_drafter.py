@@ -551,7 +551,13 @@ def _llm_factory() -> Any | None:
     except Exception:
         return None
     try:
-        return make_chat_model()
+        # "nl" is the declared role for natural-language translation
+        # (``app.llm.model_pins``). This was a bare ``make_chat_model()``,
+        # and ``role`` is required — so the TypeError was caught below and
+        # the drafter reported "no chat model available" on every call,
+        # permanently. Every test monkeypatches ``_llm_factory``, so the one
+        # line that mattered was the one line nothing exercised.
+        return make_chat_model("nl")
     except Exception as exc:
         logger.info("nl_drafter: no chat model available (%s)", exc)
         return None
@@ -665,9 +671,7 @@ async def draft_from_nl(prompt: str, *, allow_llm: bool = True) -> DraftResult:
         payload = pb.model_dump()
         valid, err = _validate_against_schema(payload)
 
-    rationale = (
-        f"Used LLM: {used_llm}. Steps: {len(pb.steps)} " f"({', '.join(s.type.value for s in pb.steps)}). " f"Trigger: {pb.trigger}."
-    )
+    rationale = f"Used LLM: {used_llm}. Steps: {len(pb.steps)} ({', '.join(s.type.value for s in pb.steps)}). Trigger: {pb.trigger}."
     return DraftResult(
         playbook=pb,
         rationale=rationale,

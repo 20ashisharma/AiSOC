@@ -46,7 +46,7 @@ from app.agents.dispositions import AUTO_CLOSEABLE_DISPOSITIONS, NEEDS_REVIEW, n
 from app.agents.triage_agent import run_triage
 from app.confidence.groundedness import score_groundedness
 from app.core.cost_governor import Decision, get_governor
-from app.core.cost_telemetry import CostTracker
+from app.core.cost_telemetry import CostSummary, CostTracker
 from app.graph.runner import default_budget, run_escalation
 from app.investigator import ledger as ledger_module
 from app.investigator import siem_writeback
@@ -241,6 +241,7 @@ class FusedAlertTriageWorker:
         self._consumer: Any | None = None
         self._producer: Any | None = None  # lazily created for the DLQ
         self._running = False
+        self._attached = False
         # Phase B4 — environment-specific noise reduction applied post-fusion →
         # pre-triage. None = disabled (no rules file / flag off).
         self._business_context = business_context
@@ -260,6 +261,7 @@ class FusedAlertTriageWorker:
         )
         await self._consumer.start()
         self._running = True
+        self._attached = True
         logger.info("auto_triage_worker.started", topic=self._topic, group=self._group_id)
         try:
             async for msg in self._consumer:
@@ -269,12 +271,33 @@ class FusedAlertTriageWorker:
                 # or after the poison alert is dead-lettered — so a crash between
                 # inference and persistence replays the alert instead of losing
                 # it, and offsets advance only on durable completion (issue #571).
-                await self._process_with_retry(msg.value)
+                #
+                # ``_process_with_retry`` catches and dead-letters rather than
+                # raising, which is the reason this loop survives a poison
+                # alert. The guard is here as well because that is a property
+                # of another method: the loop must not depend on a callee
+                # staying total, which is exactly how the ueba consumer came
+                # to have no ``except`` on its only handler.
+                try:
+                    await self._process_with_retry(msg.value)
+                except Exception as exc:  # noqa: BLE001 — one alert must not end the subscription
+                    _METRICS["errors"] += 1
+                    logger.error(
+                        "auto_triage_worker.handler_escaped",
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                        partition=getattr(msg, "partition", None),
+                        offset=getattr(msg, "offset", None),
+                        exc_info=True,
+                    )
                 try:
                     await self._consumer.commit()
                 except Exception as commit_exc:  # noqa: BLE001 — reprocess on restart
                     logger.warning("auto_triage_worker.commit_failed", error=str(commit_exc))
         finally:
+            # Cleared before the teardown await, which can itself raise on a
+            # broker that has gone away.
+            self._attached = False
             await self._consumer.stop()
 
     async def _process_with_retry(self, message: Any) -> bool:
@@ -349,8 +372,19 @@ class FusedAlertTriageWorker:
         except Exception as exc:  # noqa: BLE001 — never wedge the loop on a DLQ failure
             logger.error("auto_triage_worker.dlq_send_failed", alert_id=alert_id, error=str(exc))
 
+    @property
+    def topic(self) -> str:
+        """The topic this worker subscribes to (names its readiness probe)."""
+        return self._topic
+
+    @property
+    def attached(self) -> bool:
+        """Whether the consume loop is currently iterating the subscription."""
+        return self._attached
+
     async def stop(self) -> None:
         self._running = False
+        self._attached = False
         if self._consumer is not None:
             await self._consumer.stop()
             self._consumer = None
@@ -410,7 +444,9 @@ class FusedAlertTriageWorker:
         decision = governor.check(str(state.tenant_id), fingerprint)
 
         tier: str
-        cost_usd = 0.0
+        # None, not 0.0: a cached or deterministic verdict placed no LLM call,
+        # and "no call was made" is a different fact from "the call was free".
+        cost: CostSummary = CostSummary()
         tokens = 0
         if decision.decision is Decision.DEDUPLICATED and decision.cached_verdict:
             _METRICS["deduplicated"] += 1
@@ -427,13 +463,29 @@ class FusedAlertTriageWorker:
                 if use_llm and cfg is not None:
                     # Route the LLM call through the tenant's BYOK key/model so
                     # auto-triage actually honours per-tenant credentials.
-                    with llm_override(api_key=cfg.api_key, base_url=cfg.base_url, model=cfg.model):
+                    #
+                    # Only the fields the *tenant* set are overrides. The
+                    # resolver also carries an env baseline, and passing that
+                    # through here replaced the `triage` role's gateway alias
+                    # with whatever `OPENAI_MODEL` held — `gpt-4-turbo-preview`
+                    # in the shipped .env.example, which the gateway 400s. An
+                    # env default is not a per-tenant override.
+                    # The key needs the same treatment: the env baseline's key
+                    # is a *provider* key, and forcing it here would send it to
+                    # the gateway as a bearer token, which 401s. Left unset,
+                    # make_chat_model resolves the key that pairs with the route
+                    # it actually chose.
+                    with llm_override(
+                        api_key=cfg.api_key if getattr(cfg, "api_key_from_tenant", False) else None,
+                        base_url=cfg.base_url if getattr(cfg, "base_url_from_tenant", False) else None,
+                        model=cfg.model if getattr(cfg, "model_from_tenant", False) else None,
+                    ):
                         state, tier = await self._llm_triage(state)
                 else:
                     state = await run_triage(state)
                     tier = "deterministic"
                     _METRICS["deterministic"] += 1
-                cost_usd = tracker.total_cost_usd
+                cost = CostSummary.from_tracker(tracker)
                 tokens = tracker.total_tokens
             verdict = state.verdict
             confidence = state.confidence
@@ -450,11 +502,18 @@ class FusedAlertTriageWorker:
             # dedups instead of re-paying) and account the spend (so per-tenant
             # budgets + the circuit breaker actually fire). Best-effort.
             try:
+                # The budget circuit breaker gets measured spend only. Fed the
+                # old alias-priced guess it would eventually trip
+                # AISOC_BUDGET_HARD_USD on a local deployment and degrade a
+                # working install to deterministic-only over money nobody
+                # spent. An unmeasured call contributes no dollars — it still
+                # contributes tokens, which is the cap that can be enforced
+                # honestly without a price.
                 governor.record_verdict(
                     str(state.tenant_id),
                     fingerprint,
                     {"verdict": verdict, "confidence": confidence},
-                    usd=cost_usd,
+                    usd=cost.measured_usd or 0.0,
                     tokens=tokens,
                 )
             except Exception as exc:  # noqa: BLE001 — governance accounting is best-effort
@@ -468,7 +527,7 @@ class FusedAlertTriageWorker:
         verdict, confidence = self._apply_groundedness_gate(state, verdict, confidence)
 
         _METRICS["triaged"] += 1
-        await self._record(state, tier=tier, verdict=verdict, confidence=confidence, tokens=tokens, cost_usd=cost_usd)
+        await self._record(state, tier=tier, verdict=verdict, confidence=confidence, tokens=tokens, cost=cost)
 
         # Wave 1 — write the durable outcome back as a per-signature prior so
         # autonomous closures compound (a later identical alert can suppress).
@@ -701,10 +760,14 @@ class FusedAlertTriageWorker:
         """Resolve the tenant's LLM config, or None to force deterministic triage."""
         try:
             cfg = await resolve_llm_config(str(tenant_id))
-            return cfg if (cfg.allowed and cfg.api_key) else None
         except Exception as exc:  # noqa: BLE001 — resolver failure => deterministic
             logger.debug("auto_triage_worker.llm_resolve_failed", error=str(exc))
             return None
+        # The resolver's env baseline now resolves the bearer that pairs with
+        # the route it chose, so a deployment doing exactly what the compose
+        # file sets up — gateway URL and master key, provider key held by the
+        # gateway — reports a usable key here instead of "none configured".
+        return cfg if (cfg.allowed and cfg.api_key) else None
 
     async def _llm_triage(self, state: InvestigationState) -> tuple[InvestigationState, str]:
         try:
@@ -783,7 +846,7 @@ class FusedAlertTriageWorker:
         verdict: Any,
         confidence: float,
         tokens: int = 0,
-        cost_usd: float = 0.0,
+        cost: CostSummary | None = None,
     ) -> None:
         """Durably persist the triage outcome (issue #571).
 
@@ -819,7 +882,11 @@ class FusedAlertTriageWorker:
             auto_closed=state.status is AgentStatus.COMPLETED,
             iterations=state.iteration_count,
             tokens=tokens,
-            cost_usd=cost_usd,
+            cost_usd=(cost or CostSummary()).measured_usd,
+            measured_call_count=(cost or CostSummary()).measured_calls,
+            estimated_cost_usd=(cost or CostSummary()).estimated_usd,
+            estimated_call_count=(cost or CostSummary()).estimated_calls,
+            unpriced_call_count=(cost or CostSummary()).unpriced_calls,
             # Persisted so an ungrounded auto-closure is auditable after the
             # fact and aggregatable on /metrics/funnel, rather than surviving
             # only inside a findings string.

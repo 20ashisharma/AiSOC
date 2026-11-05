@@ -32,7 +32,7 @@ from urllib.parse import quote
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 
 from app.core.logging import safe_log_value
 
@@ -40,10 +40,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/fusion", tags=["fusion"])
 
-# When set, requests are forwarded to the live fusion service. When unset,
-# the gateway returns deterministic, empty fallbacks so the UI degrades
-# gracefully instead of bubbling 5xx into the analyst console.
-_FUSION_URL = (os.getenv("FUSION_SERVICE_URL") or os.getenv("FUSION_URL") or "").rstrip("/")
+# Default to http://fusion:8003 in docker compose network if not explicitly set
+_FUSION_URL = (
+    os.getenv("FUSION_SERVICE_URL")
+    or os.getenv("FUSION_URL")
+    or "http://fusion:8003"
+).rstrip("/")
 
 # Tight allowlist for proxied request paths. We only ever proxy to a fixed
 # upstream (`_FUSION_URL`) on a known set of routes, so the path must be a
@@ -52,11 +54,36 @@ _FUSION_URL = (os.getenv("FUSION_SERVICE_URL") or os.getenv("FUSION_URL") or "")
 # request elsewhere) and log-injection (the path can never contain CR/LF).
 _SAFE_PATH_RE = re.compile(r"^/[A-Za-z0-9_\-./%]*$")
 
+_DEFAULT_TENANT_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+
+def _resolve_tenant_id(
+    query_tenant_id: str | None = None,
+    header_tenant_id: str | None = None,
+) -> UUID:
+    """Resolve tenant ID from query param, X-Tenant-Id header, or default.
+
+    Handles empty strings, None, and slugs like 'default'/'demo' gracefully.
+    """
+    for candidate in (query_tenant_id, header_tenant_id):
+        if not candidate:
+            continue
+        val = candidate.strip()
+        if not val:
+            continue
+        if val.lower() in ("default", "demo"):
+            return _DEFAULT_TENANT_ID
+        try:
+            return UUID(val)
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return _DEFAULT_TENANT_ID
+
 
 def _validate_proxy_path(path: str) -> str:
     """Reject any proxied path that isn't a tightly constrained relative path."""
     if (
-        not isinstance(path, str) or not _SAFE_PATH_RE.match(path) or ".." in path or path.startswith("//")  # protocol-relative URL
+        not isinstance(path, str) or not _SAFE_PATH_RE.match(path) or ".." in path or path.startswith("//")
     ):
         raise HTTPException(status_code=400, detail="invalid_request_path")
     return path
@@ -80,7 +107,6 @@ async def _proxy_get(path: str, params: dict[str, Any] | None = None) -> dict[st
             )
             return None
         if resp.status_code == 404:
-            # Let caller surface 404 cleanly.
             raise HTTPException(status_code=404, detail="not_found")
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
@@ -137,21 +163,21 @@ async def ml_status() -> dict[str, Any]:
 
 # ─── Entity risk (RBA) ─────────────────────────────────────────────────────
 
-# The threshold here mirrors services/fusion/app/services/entity_risk.py
-# default; the UI displays it as "promotion threshold".
 _DEFAULT_THRESHOLD = 100.0
 
 
 @router.get("/entity-risk/queue", summary="Top entities by risk score")
 async def entity_risk_queue(
-    tenant_id: UUID,
+    tenant_id: str | None = Query(default=None),
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
     limit: int = Query(default=25, ge=1, le=200),
     promoted_only: bool = False,
 ) -> dict[str, Any]:
+    resolved_tenant_id = _resolve_tenant_id(tenant_id, x_tenant_id)
     upstream = await _proxy_get(
         "/entity-risk/queue",
         params={
-            "tenant_id": str(tenant_id),
+            "tenant_id": str(resolved_tenant_id),
             "limit": limit,
             "promoted_only": str(promoted_only).lower(),
         },
@@ -159,26 +185,44 @@ async def entity_risk_queue(
     if upstream is not None:
         return upstream
     return {
-        "tenant_id": str(tenant_id),
+        "tenant_id": str(resolved_tenant_id),
         "threshold": _DEFAULT_THRESHOLD,
         "entities": [],
     }
 
 
 @router.get("/entity-risk/stats", summary="Entity-risk queue stats")
-async def entity_risk_stats(tenant_id: UUID) -> dict[str, Any]:
+async def entity_risk_stats(
+    tenant_id: str | None = Query(default=None),
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
+) -> dict[str, Any]:
+    resolved_tenant_id = _resolve_tenant_id(tenant_id, x_tenant_id)
     upstream = await _proxy_get(
         "/entity-risk/stats",
-        params={"tenant_id": str(tenant_id)},
+        params={"tenant_id": str(resolved_tenant_id)},
     )
     if upstream is not None:
-        return upstream
+        total = upstream.get("total", upstream.get("tracked_entities", 0))
+        promoted = upstream.get("promoted", upstream.get("promoted_entities", 0))
+        bands = upstream.get("bands", upstream.get("score_bands", {"critical": 0, "high": 0, "medium": 0, "low": 0}))
+        threshold = upstream.get("threshold", _DEFAULT_THRESHOLD)
+        alert_count = upstream.get("alert_count", upstream.get("alerts_total", 0))
+        return {
+            "tenant_id": str(resolved_tenant_id),
+            "threshold": threshold,
+            "total": total,
+            "promoted": promoted,
+            "bands": bands,
+            "alert_count": alert_count,
+            **upstream,
+        }
     return {
-        "tenant_id": str(tenant_id),
+        "tenant_id": str(resolved_tenant_id),
         "threshold": _DEFAULT_THRESHOLD,
         "total": 0,
         "promoted": 0,
         "bands": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+        "alert_count": 0,
         "alerts_total": 0,
     }
 
@@ -190,20 +234,18 @@ async def entity_risk_stats(tenant_id: UUID) -> dict[str, Any]:
 async def entity_risk_detail(
     entity_type: str,
     entity_value: str,
-    tenant_id: UUID,
+    tenant_id: str | None = Query(default=None),
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> dict[str, Any]:
+    resolved_tenant_id = _resolve_tenant_id(tenant_id, x_tenant_id)
     if entity_type == "ip":
         entity_type = "src_ip"
-    # URL-encode user-controlled path segments so they cannot inject `/`,
-    # `?`, `#`, or other URL syntax into the proxied path.
     safe_type = quote(entity_type, safe="")
     safe_value = quote(entity_value, safe="")
     upstream = await _proxy_get(
         f"/entity-risk/{safe_type}/{safe_value}",
-        params={"tenant_id": str(tenant_id)},
+        params={"tenant_id": str(resolved_tenant_id)},
     )
     if upstream is not None:
         return upstream
-    # No fallback record exists when fusion is offline; surface 404 so the
-    # drawer renders its empty state.
     raise HTTPException(status_code=404, detail="entity_not_found")

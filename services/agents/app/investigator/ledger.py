@@ -150,8 +150,16 @@ async def resolve_tenant(tenant_ref: str) -> uuid.UUID | None:
 
 async def _set_rls_context(conn: asyncpg.Connection, tenant_id: uuid.UUID) -> None:
     """Match the API service's set_rls_context — required so the audit-log
-    immutability trigger and tenant policies allow our INSERTs."""
-    await conn.execute("SELECT set_config('app.tenant_id', $1, true)", str(tenant_id))
+    immutability trigger and tenant policies allow our INSERTs.
+
+    The variable is ``app.current_tenant_id``. It said ``app.tenant_id`` until
+    2026-09, which is a name no policy in this schema reads, so the scoping
+    this function exists to provide was never applied: every policy fell
+    through its ``current_tenant_id() IS NULL`` arm and admitted everything.
+    Nothing failed, because failing open is what an unset context does — and
+    because the role the services connect as bypasses RLS outright.
+    """
+    await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant_id))
 
 
 async def start_run(
@@ -335,9 +343,24 @@ async def complete_run(
     error: str | None = None,
     iterations: int = 0,
     total_tokens: int = 0,
-    total_cost_usd: float = 0.0,
+    total_cost_usd: float | None = None,
+    measured_call_count: int = 0,
+    estimated_cost_usd: float | None = None,
+    estimated_call_count: int = 0,
+    unpriced_call_count: int = 0,
 ) -> None:
-    """Finalise the run. Status should be 'completed' or 'failed'."""
+    """Finalise the run. Status should be 'completed' or 'failed'.
+
+    ``total_cost_usd`` is **measured** cost — what the gateway reported — and
+    ``None`` means no call on this run reported one. It is not defaulted to
+    ``0.0`` any more: every caller in this service omitted it, so every deep
+    investigation closed with a hard-coded zero that the ledger UI rendered as
+    ``$0.0000`` beside a run that had made real LLM calls.
+
+    The counts travel with the sums so a consumer can distinguish "measured,
+    and it was free" from "nothing measured it" — see migration
+    ``055_cost_provenance.sql``.
+    """
     pool = await get_pool()
     if pool is None:
         return
@@ -352,7 +375,11 @@ async def complete_run(
                        error = $3,
                        iterations = $4,
                        total_tokens = $5,
-                       total_cost_usd = $6,
+                       total_cost_usd = COALESCE($6, total_cost_usd),
+                       measured_call_count = $7,
+                       estimated_cost_usd = COALESCE($8, estimated_cost_usd),
+                       estimated_call_count = $9,
+                       unpriced_call_count = $10,
                        completed_at = now()
                  WHERE id = $1
                 """,
@@ -362,6 +389,10 @@ async def complete_run(
                 iterations,
                 total_tokens,
                 total_cost_usd,
+                measured_call_count,
+                estimated_cost_usd,
+                estimated_call_count,
+                unpriced_call_count,
             )
             logger.info(
                 "ledger.run_completed",
@@ -400,7 +431,11 @@ async def persist_auto_triage(
     auto_closed: bool = False,
     iterations: int = 0,
     tokens: int = 0,
-    cost_usd: float = 0.0,
+    cost_usd: float | None = None,
+    measured_call_count: int = 0,
+    estimated_cost_usd: float | None = None,
+    estimated_call_count: int = 0,
+    unpriced_call_count: int = 0,
     groundedness: float | None = None,
     ungrounded: bool | None = None,
 ) -> bool:
@@ -479,16 +514,30 @@ async def persist_auto_triage(
                     ),
                 )
                 await conn.execute(
+                    # `total_cost_usd` is measured cost only. It used to carry
+                    # a list-price guess keyed on a gateway alias, so a local
+                    # deployment that spent nothing accrued a per-alert dollar
+                    # figure here and everywhere reading from here.
                     """
                     UPDATE investigation_runs
                        SET status = 'completed', iterations = $2,
-                           total_tokens = $3, total_cost_usd = $4, completed_at = now()
+                           total_tokens = $3,
+                           total_cost_usd = $4,
+                           measured_call_count = $5,
+                           estimated_cost_usd = $6,
+                           estimated_call_count = $7,
+                           unpriced_call_count = $8,
+                           completed_at = now()
                      WHERE id = $1
                     """,
                     run_id,
                     iterations,
                     tokens,
                     cost_usd,
+                    measured_call_count,
+                    estimated_cost_usd,
+                    estimated_call_count,
+                    unpriced_call_count,
                 )
                 if alert_uuid is not None:
                     # Surface the automated verdict on the alert row. Status is

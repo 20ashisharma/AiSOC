@@ -61,6 +61,7 @@ services:
       - ./services/api/migrations:/docker-entrypoint-initdb.d:ro
     networks:
       - aisoc
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U aisoc"]
       interval: 10s
@@ -77,6 +78,7 @@ services:
       - redis_data:/data
     networks:
       - aisoc
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "redis_dev_secret", "ping"]
       interval: 10s
@@ -91,6 +93,7 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     networks:
       - aisoc
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "2181"]
       interval: 10s
@@ -116,6 +119,7 @@ services:
       KAFKA_LOG_RETENTION_HOURS: 168
     networks:
       - aisoc
+    restart: unless-stopped
     volumes:
       - kafka_data:/var/lib/kafka/data
     # Memory caps surface OOMKiller events as a clear container exit instead of
@@ -275,6 +279,9 @@ services:
       # is the container_name, not the DNS name on this network.
       AISOC_ACTIONS_BASE_URL: http://actions:8085
       AISOC_ACTIONS_SERVICE_TOKEN: ${AISOC_ACTIONS_SERVICE_TOKEN:-}
+      FUSION_SERVICE_URL: http://fusion:8003
+    volumes:
+      - ./services/api/app:/app/app
     # Phase 2.6 — use /readyz, not /health, so the orchestrator
     # only routes traffic once the lifespan has finished wiring
     # Postgres, Redis, Kafka, Qdrant, and Neo4j. (Not OpenSearch: this
@@ -426,6 +433,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://aisoc:${POSTGRES_PASSWORD:-aisoc_dev_secret}@postgres:5432/aisoc
       REDIS_URL: redis://:redis_dev_secret@redis:6379/4
       CORE_API_URL: http://api:8000
+      AISOC_DEV_MODE: "true"
       # Phase B1 — auto-triage every fused alert off the Kafka stream (copilot:
       # read-only triage, no response dispatch). Degrades to deterministic
       # triage when no LLM key is set.
@@ -451,6 +459,9 @@ services:
       # service, so this only resolves when that profile is up.
       AISOC_SLACK_BOT_URL: ${AISOC_SLACK_BOT_URL:-}
       AISOC_INTERNAL_TOKEN: ${AISOC_INTERNAL_TOKEN:-}
+      REALTIME_URL: http://realtime:8086
+    volumes:
+      - ./services/agents/app:/app/app
     networks:
       - aisoc
     restart: unless-stopped
@@ -736,12 +747,12 @@ services:
       kafka:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8086:4000"
+      - "127.0.0.1:8086:8086"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       REDIS_URL: redis://:redis_dev_secret@redis:6379
       REDIS_PASSWORD: redis_dev_secret
-      PORT: 4000
+      PORT: 8086
     networks:
       - aisoc
     restart: unless-stopped

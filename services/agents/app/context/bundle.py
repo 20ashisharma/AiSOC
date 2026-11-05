@@ -361,7 +361,7 @@ class ContextBundle(BaseModel):
         s = self.summary_for_llm()
         parts: list[str] = ["", "Pre-fetched investigation context (ContextBundle):"]
         if s.get("entity_count"):
-            parts.append(f"- Entities resolved: {s['entity_count']} " f"({', '.join(s.get('entity_types') or []) or 'unknown'})")
+            parts.append(f"- Entities resolved: {s['entity_count']} ({', '.join(s.get('entity_types') or []) or 'unknown'})")
         if s.get("neighborhood_summaries"):
             parts.append("- Graph neighbourhood:")
             for line in s["neighborhood_summaries"]:
@@ -373,13 +373,12 @@ class ContextBundle(BaseModel):
                 (h["similarity"] for h in s.get("historical_verdicts") or []),
                 default=0.0,
             )
-            parts.append(f"- Similar historical cases: {s['historical_similar_count']} " f"(top similarity={top:.2f})")
+            parts.append(f"- Similar historical cases: {s['historical_similar_count']} (top similarity={top:.2f})")
             for h in (s.get("historical_verdicts") or [])[:3]:
                 parts.append(f"    * {h['key']} → {h['verdict']} (sim={h['similarity']:.2f})")
         if s.get("ueba_entities_with_baseline"):
             parts.append(
-                f"- UEBA: {s['ueba_entities_with_baseline']} entities with baseline, "
-                f"max deviation={s.get('ueba_max_deviation', 0.0):.2f}"
+                f"- UEBA: {s['ueba_entities_with_baseline']} entities with baseline, max deviation={s.get('ueba_max_deviation', 0.0):.2f}"
             )
         if s.get("threat_intel_match_count"):
             parts.append(
@@ -633,7 +632,12 @@ class ContextBundleBuilder:
         out: dict[str, EntityNeighborhood] = {}
         results = await asyncio.gather(*[_walk(e) for e in principals], return_exceptions=True)
         for r in results:
-            if isinstance(r, Exception):
+            # BaseException, not Exception: `gather(return_exceptions=True)`
+            # hands back a cancelled child's `CancelledError`, which is a
+            # BaseException on 3.8+. Filtering on `Exception` let it through
+            # to the unpack below, turning a cancelled graph walk into
+            # `TypeError: cannot unpack non-sequence CancelledError`.
+            if isinstance(r, BaseException):
                 logger.debug("context.neighborhood.failed", error=str(r))
                 continue
             key, nbr = r
@@ -738,7 +742,9 @@ class ContextBundleBuilder:
 
             results = await asyncio.gather(*[_one(e) for e in principals], return_exceptions=True)
             for r in results:
-                if isinstance(r, Exception) or r is None:
+                # See `_fetch_neighborhoods`: a cancelled child returns a
+                # `CancelledError`, which is not an `Exception`.
+                if isinstance(r, BaseException) or r is None:
                     continue
                 key, baseline = r
                 out[key] = baseline

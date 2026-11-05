@@ -287,8 +287,21 @@ def _risk_overlap(seed: CandidateAlert, cand: CandidateAlert) -> float:
 
     The two terms are averaged so neither dominates.
     """
-    a = set(seed.mitre_techniques or ())
-    b = set(cand.mitre_techniques or ())
+    def _extract_ids(items: Any) -> set[str]:
+        if not items:
+            return set()
+        res = set()
+        for item in items:
+            if isinstance(item, str):
+                res.add(item)
+            elif isinstance(item, dict):
+                tid = item.get("id") or item.get("technique_id") or item.get("technique")
+                if tid:
+                    res.add(str(tid))
+        return res
+
+    a = _extract_ids(seed.mitre_techniques)
+    b = _extract_ids(cand.mitre_techniques)
     if a or b:
         jaccard = len(a & b) / max(1, len(a | b))
     else:
@@ -594,6 +607,20 @@ class PostgresAttackChainLoader:
         return [_row_to_candidate(row) for row in rows]
 
 
+def _normalize_techniques(items: Any) -> tuple[str, ...]:
+    if not items:
+        return ()
+    res = []
+    for item in items:
+        if isinstance(item, str):
+            res.append(item)
+        elif isinstance(item, dict):
+            tid = item.get("id") or item.get("technique_id") or item.get("technique")
+            if tid:
+                res.append(str(tid))
+    return tuple(res)
+
+
 def _row_to_candidate(row: Any) -> CandidateAlert:
     return CandidateAlert(
         id=row.id,
@@ -601,7 +628,7 @@ def _row_to_candidate(row: Any) -> CandidateAlert:
         title=row.title,
         severity=row.severity or "info",
         event_time=row.event_time,
-        mitre_techniques=tuple(row.mitre_techniques or ()),
+        mitre_techniques=_normalize_techniques(row.mitre_techniques),
         affected_users=tuple(row.affected_users or ()),
         affected_hosts=tuple(row.affected_hosts or ()),
         affected_ips=tuple(row.affected_ips or ()),

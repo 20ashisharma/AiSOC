@@ -82,6 +82,9 @@ class Alert(Base):
     entities: Mapped[list] = mapped_column(JSONB, default=list)
 
     # Relations
+    incident_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    fusion_decision: Mapped[str | None] = mapped_column(String, nullable=True)
+
     case_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
     parent_alert_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     child_alert_ids: Mapped[list] = mapped_column(JSONB, default=list)

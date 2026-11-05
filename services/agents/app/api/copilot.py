@@ -16,20 +16,25 @@ from __future__ import annotations
 
 import itertools
 import json
-import os
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from app.security.tenant_scope import require_console_or_service_auth
+
 logger = structlog.get_logger()
 
-router = APIRouter(prefix="/api/v1/copilot", tags=["copilot"])
+#: Default-deny. The console reaches this router directly through a Next
+#: rewrite carrying the first-party access token, so the guard resolves
+#: either that session or a trusted service declaring the tenant it acts
+#: for — a bearer-token-only scheme would lock the browser out.
+router = APIRouter(prefix="/api/v1/copilot", tags=["copilot"], dependencies=[Depends(require_console_or_service_auth)])
 
 
 # ---------------------------------------------------------------------------
@@ -130,13 +135,18 @@ async def _get_openai_reply(
     alerts" as real analysis of their environment. The frontend had an honest
     fallback of its own that never fired, because the backend reported success.
     """
-    api_key = os.getenv("OPENAI_API_KEY", "")
+    from app.llm.factory import resolve_api_key, resolve_model_alias
+
+    model = resolve_model_alias("copilot")
+    # Resolved with the route, not from OPENAI_API_KEY directly: when the call
+    # goes to the bundled gateway the bearer has to be the gateway's master key.
+    api_key = resolve_api_key(model) or ""
     if not api_key:
         return _synthetic_reply(user_message), "template"
 
     try:
         from app.llm.contract import safe_chat_completions_request
-        from app.llm.factory import chat_completions_url, resolve_model_alias
+        from app.llm.factory import chat_completions_url
 
         messages: list[dict[str, str]] = [
             {
@@ -155,9 +165,9 @@ async def _get_openai_reply(
 
         body = await safe_chat_completions_request(
             api_key=api_key,
-            model=resolve_model_alias("copilot"),
+            model=model,
             messages=messages,
-            url=chat_completions_url(),
+            url=chat_completions_url(model),
             max_tokens=512,
         )
         return body["choices"][0]["message"]["content"], "llm"

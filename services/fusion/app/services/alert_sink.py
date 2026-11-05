@@ -71,7 +71,7 @@ INSERT INTO alerts (
     dedup_hash, confidence, confidence_label, confidence_rationale,
     narrative, anomaly_score, event_time,
     connector_id, connector_type, source_event_ids, ocsf_class_uid,
-    rule_id, rule_name, external_id
+    rule_id, rule_name, external_id, incident_id, fusion_decision
 )
 SELECT
     $1, $2, $3, $4, $5, 'new',
@@ -79,7 +79,7 @@ SELECT
     $11::text, $12, $13, $14::jsonb,
     $15, $16, COALESCE($17, NOW()),
     $18, $19, $20::jsonb, $21,
-    $22, $23, $24
+    $22, $23, $24, $25, $26
 WHERE NOT EXISTS (
     SELECT 1 FROM alerts WHERE tenant_id = $2 AND dedup_hash = $11::text
 )
@@ -247,6 +247,8 @@ class AlertSink:
                     alert.rule_id,
                     alert.rule_name,
                     alert.external_id,
+                    fused.incident_id,
+                    fused.fusion_decision.value,
                 )
             if row is None:
                 logger.debug("alert_sink.dedup_skip", fingerprint=alert.fingerprint())
