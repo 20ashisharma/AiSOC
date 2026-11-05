@@ -1,0 +1,178 @@
+"""The README figures gate must actually catch drift.
+
+The README quoted 947 executable detection rules while the generated truth
+table said 833, and 62 GATED claims while the matrix held 72. Both survived
+review because nothing compared the front page to the artifact it was
+summarising. These tests pin that comparison down: a gate that only ever
+passes is indistinguishable from no gate.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+GATES = REPO_ROOT / "scripts" / "readme_gates.py"
+
+
+def _load_gates(tmp_root: Path):
+    """Import readme_gates.py with REPO_ROOT pointed at a scratch tree."""
+    spec = importlib.util.spec_from_file_location("_readme_gates_under_test", GATES)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    module.REPO_ROOT = tmp_root
+    module.README = tmp_root / "README.md"
+    module.TRUTH_TABLE = tmp_root / "docs" / "detections" / "truth-table.md"
+    module.CLAIM_MATRIX = tmp_root / "docs" / "audit" / "CLAIM_TO_GATE_MATRIX.md"
+    # Every module-level path, not just REPO_ROOT: leaving FIGURE_DOCS
+    # pointing at the real tree made the gate read the live compliance page
+    # against a scratch matrix, and every test failed for a reason that had
+    # nothing to do with what it was testing.
+    module.FIGURE_DOCS = (tmp_root / "apps" / "docs" / "docs" / "compliance" / "evidence-pack.md",)
+    return module
+
+
+TRUTH_TABLE = """# truth table
+
+| metric | count |
+|--------|------:|
+| rules on disk (total) | 6991 |
+| **executable (loaded by the engine)** | **833** |
+"""
+
+MATRIX = """# matrix
+
+| claim | source | gate | status | gap |
+|---|---|---|---|---|
+| one | README | ci.yml | GATED | - |
+| two | README | ci.yml | GATED | - |
+| three | README | ci.yml | PARTIAL | worker |
+"""
+
+
+@pytest.fixture
+def tree(tmp_path: Path) -> Path:
+    (tmp_path / "docs" / "detections").mkdir(parents=True)
+    (tmp_path / "docs" / "audit").mkdir(parents=True)
+    (tmp_path / "docs" / "detections" / "truth-table.md").write_text(TRUTH_TABLE)
+    (tmp_path / "docs" / "audit" / "CLAIM_TO_GATE_MATRIX.md").write_text(MATRIX)
+    return tmp_path
+
+
+def test_matching_figures_pass(tree: Path) -> None:
+    (tree / "README.md").write_text("833 executable rules today, and 2 GATED / 1 PARTIAL / 0 NO GATE.\n")
+    assert _load_gates(tree).gate_readme_figures() == []
+
+
+def test_inflated_detection_count_fails(tree: Path) -> None:
+    """The exact drift that shipped: README 947 vs truth table 833."""
+    (tree / "README.md").write_text("947 executable rules. 2 GATED / 1 PARTIAL.\n")
+    failures = _load_gates(tree).gate_readme_figures()
+    assert len(failures) == 1
+    assert "947" in failures[0].detail and "833" in failures[0].detail
+
+
+def test_corpus_phrasing_is_also_checked(tree: Path) -> None:
+    """'detection corpus (N rules)' is the README's other spelling of the count."""
+    (tree / "README.md").write_text("the detection corpus (947 rules) fires. 2 GATED / 1 PARTIAL.\n")
+    failures = _load_gates(tree).gate_readme_figures()
+    assert len(failures) == 1
+    assert "947" in failures[0].detail
+
+
+def test_stale_claim_tally_fails(tree: Path) -> None:
+    (tree / "README.md").write_text("833 executable. 62 GATED / 11 PARTIAL / 0 NO GATE.\n")
+    failures = _load_gates(tree).gate_readme_figures()
+    assert len(failures) == 1
+    assert "62" in failures[0].detail and "2 GATED" in failures[0].detail
+
+
+def test_partial_rows_are_not_counted_as_gated(tree: Path) -> None:
+    """A PARTIAL row contains the substring 'GATED' only via 'NO GATE'/'PARTIAL' prose.
+
+    Counting naively would report 3 GATED here and silently inflate the tally,
+    which is the same class of error the gate exists to prevent.
+    """
+    gated, partial = _load_gates(tree)._matrix_counts()
+    assert (gated, partial) == (2, 1)
+
+
+def test_missing_sources_do_not_crash_the_gate(tmp_path: Path) -> None:
+    """A partial checkout should skip these checks, not raise."""
+    (tmp_path / "README.md").write_text("833 executable. 2 GATED / 1 PARTIAL.\n")
+    assert _load_gates(tmp_path).gate_readme_figures() == []
+
+
+def test_live_repo_is_consistent() -> None:
+    """The gate must pass against the real tree, not only fixtures."""
+    module = _load_gates(REPO_ROOT)
+    assert module.gate_readme_figures() == []
+
+
+def test_other_docs_quoting_the_tally_are_checked(tree: Path) -> None:
+    """A compliance page quoting a stale number is worse than one quoting none."""
+    (tree / "README.md").write_text("833 executable. 2 GATED / 1 PARTIAL.\n")
+    pack = tree / "apps" / "docs" / "docs" / "compliance" / "evidence-pack.md"
+    pack.parent.mkdir(parents=True, exist_ok=True)
+    pack.write_text("The honest index: 62 rows\n`GATED`, 11 `PARTIAL` with gaps named.\n")
+
+    failures = _load_gates(tree).gate_readme_figures()
+    assert len(failures) == 1
+    assert "evidence-pack.md" in failures[0].detail
+    assert "62" in failures[0].detail
+
+
+def test_a_matching_compliance_page_passes(tree: Path) -> None:
+    (tree / "README.md").write_text("833 executable. 2 GATED / 1 PARTIAL.\n")
+    pack = tree / "apps" / "docs" / "docs" / "compliance" / "evidence-pack.md"
+    pack.parent.mkdir(parents=True, exist_ok=True)
+    pack.write_text("The honest index: 2 rows\n`GATED`, 1 `PARTIAL` with gaps named.\n")
+    assert _load_gates(tree).gate_readme_figures() == []
+
+
+def test_an_absent_compliance_page_is_not_a_failure(tree: Path) -> None:
+    """A partial checkout must skip the check, not fail it."""
+    (tree / "README.md").write_text("833 executable. 2 GATED / 1 PARTIAL.\n")
+    assert _load_gates(tree).gate_readme_figures() == []
+
+
+# The matrix's own Summary block. This gate compared every prose restatement
+# elsewhere against the rows and never the document doing the claiming, so the
+# summary read "GATED: 108" against 109 counted rows and CI stayed green — the
+# one-directional shape the matrix file's own counting note warns about.
+STALE_SUMMARY = MATRIX + "\n## Summary\n\n- GATED: 7\n- PARTIAL: 1\n- NO GATE: 0\n"
+CURRENT_SUMMARY = MATRIX + "\n## Summary\n\n- GATED: 2\n- PARTIAL: 1\n- NO GATE: 0\n"
+
+
+def test_matrix_summary_disagreeing_with_its_own_rows_fails(tree: Path) -> None:
+    (tree / "README.md").write_text("833 executable. 2 GATED / 1 PARTIAL.\n")
+    (tree / "docs" / "audit" / "CLAIM_TO_GATE_MATRIX.md").write_text(STALE_SUMMARY)
+
+    failures = _load_gates(tree).gate_readme_figures()
+    assert len(failures) == 1, failures
+    assert "CLAIM_TO_GATE_MATRIX.md" in failures[0].detail
+    assert "GATED: 7" in failures[0].detail
+    assert "2 GATED rows" in failures[0].detail
+
+
+def test_matrix_summary_matching_its_own_rows_passes(tree: Path) -> None:
+    (tree / "README.md").write_text("833 executable. 2 GATED / 1 PARTIAL.\n")
+    (tree / "docs" / "audit" / "CLAIM_TO_GATE_MATRIX.md").write_text(CURRENT_SUMMARY)
+    assert _load_gates(tree).gate_readme_figures() == []
+
+
+def test_a_stale_partial_count_in_the_summary_also_fails(tree: Path) -> None:
+    """Both figures, not just the one that happened to drift first."""
+    (tree / "README.md").write_text("833 executable. 2 GATED / 1 PARTIAL.\n")
+    (tree / "docs" / "audit" / "CLAIM_TO_GATE_MATRIX.md").write_text(MATRIX + "\n## Summary\n\n- GATED: 2\n- PARTIAL: 4\n")
+
+    failures = _load_gates(tree).gate_readme_figures()
+    assert len(failures) == 1, failures
+    assert "PARTIAL: 4" in failures[0].detail

@@ -1,0 +1,41 @@
+name: AiSOC self-scan (dogfood)
+
+# Dogfoods packages/aisoc-action on the AiSOC repo itself: triage our own
+# Dependabot / CodeQL / secret-scanning alerts. On PRs it posts a triage
+# comment; weekly it refreshes a security-posture digest issue. This is both a
+# real check and living proof the Action works.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packages/aisoc-action/**'
+      - '.github/workflows/aisoc-selfscan.yml'
+  schedule:
+    - cron: '17 13 * * 1' # Mondays 13:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: aisoc-selfscan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Triage security signals
+        uses: ./packages/aisoc-action
+        with:
+          mode: ${{ github.event_name == 'schedule' && 'digest' || 'pr-comment' }}
+          min-severity: low
+          # Non-blocking: this is informational triage, not a hard gate.
+          fail-on: none

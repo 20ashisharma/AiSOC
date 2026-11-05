@@ -1,0 +1,61 @@
+---
+title: Detection Coverage
+description: |
+  AiSOC v1.0 ships a curated set of MITRE ATT&CK-mapped
+  detections covering the eight buyer-prioritised threat
+  families. This page is generated from the on-disk corpus
+  via ``scripts/curate_detections.py`` — it is the source
+  of truth for what we promise in v1.0.
+sidebar_position: 2
+---
+
+# Detection Coverage
+
+Generated: `2026-09-23T14:16:45Z`
+
+## Headline numbers
+
+- **Curated v1.0 detections**: `418` (target: ≥ 300)
+- **Total rules considered**: `1054` (quality floor: 0.55)
+- **Unique MITRE techniques covered**: `117`
+
+## Coverage by buyer family
+
+| Family | Count | Target | Covered |
+|---|---|---|---|
+| **Ransomware** | 48 | ≥ 25 | ✅ |
+| **Credential Access** | 86 | ≥ 25 | ✅ |
+| **Lateral Movement** | 33 | ≥ 25 | ✅ |
+| **Data Exfiltration** | 42 | ≥ 25 | ✅ |
+| **Cloud** | 100 | ≥ 25 | ✅ |
+| **Identity** | 100 | ≥ 25 | ✅ |
+| **Supply Chain** | 36 | ≥ 25 | ✅ |
+| **Kubernetes / Containers** | 73 | ≥ 25 | ✅ |
+
+## Distribution
+
+### By tier
+
+- `imported`: 41
+- `native`: 377
+
+### By severity
+
+- `critical`: 100
+- `high`: 209
+- `low`: 6
+- `medium`: 103
+
+### By category
+
+- `application`: 36
+- `cloud`: 164
+- `data-exfil`: 20
+- `endpoint`: 117
+- `identity`: 69
+- `network`: 12
+
+## How to audit
+
+The curated rule IDs are listed in [`marketplace/curated.json`](https://github.com/beenuar/AiSOC/blob/main/marketplace/curated.json) under each family. Every entry has a `path` field pointing at the on-disk YAML. Run `pnpm marketplace:curate --check` in CI to enforce drift; run `python3 scripts/curate_detections.py` locally to regenerate.
+

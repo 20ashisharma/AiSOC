@@ -1,0 +1,154 @@
+{
+  "count": 10,
+  "rules": [
+    {
+      "category": "application",
+      "group_by": "agent_id",
+      "id": "wd-ai-agent-tool-denials",
+      "match_when": {
+        "outcome": "denied"
+      },
+      "mitre": [
+        "T1078"
+      ],
+      "name": "AI agent repeatedly denied a tool call",
+      "severity": "high",
+      "threshold": 10,
+      "window_seconds": 300
+    },
+    {
+      "category": "application",
+      "group_by": "agent_id",
+      "id": "wd-ai-model-fanout",
+      "match_when": {
+        "tool_name_startswith": "model:"
+      },
+      "mitre": [
+        "T1078"
+      ],
+      "name": "AI agent called an unusual number of distinct models",
+      "severity": "medium",
+      "threshold": 50,
+      "window_seconds": 300
+    },
+    {
+      "category": "identity",
+      "group_by": "user",
+      "id": "wd-mfa-fatigue",
+      "match_when": {
+        "event_type": "authentication",
+        "outcome": "denied"
+      },
+      "mitre": [
+        "T1621"
+      ],
+      "name": "MFA fatigue: repeated push denials for one account",
+      "severity": "high",
+      "threshold": 8,
+      "window_seconds": 600
+    },
+    {
+      "category": "identity",
+      "group_by": "user",
+      "id": "wd-impossible-travel-volume",
+      "match_when": {
+        "event_type": "authentication"
+      },
+      "mitre": [
+        "T1078"
+      ],
+      "name": "Many distinct source IPs authenticating one account",
+      "severity": "medium",
+      "threshold": 25,
+      "window_seconds": 900
+    },
+    {
+      "category": "data-exfil",
+      "group_by": "hostname",
+      "id": "wd-data-egress-burst",
+      "match_when": {
+        "event_type": "network"
+      },
+      "mitre": [
+        "T1041"
+      ],
+      "name": "Burst of outbound transfers from one host",
+      "severity": "high",
+      "threshold": 200,
+      "window_seconds": 300
+    },
+    {
+      "category": "identity",
+      "group_by": "user",
+      "id": "wd-high-rate-activity-per-actor",
+      "match_when": {},
+      "mitre": [
+        "T1078"
+      ],
+      "name": "Sustained high-rate activity from one actor",
+      "severity": "medium",
+      "threshold": 120,
+      "window_seconds": 60
+    },
+    {
+      "category": "network",
+      "group_by": "src_ip",
+      "id": "wd-high-rate-activity-per-source",
+      "match_when": {},
+      "mitre": [
+        "T1071"
+      ],
+      "name": "Sustained high-rate activity from one source address",
+      "severity": "medium",
+      "threshold": 300,
+      "window_seconds": 60
+    },
+    {
+      "category": "identity",
+      "distinct_by": "secret_name",
+      "group_by": "user",
+      "id": "wd-secret-enumeration",
+      "match_when": {
+        "event_type": "secret_access"
+      },
+      "mitre": [
+        "T1552.007"
+      ],
+      "name": "Many distinct secrets read by one principal",
+      "severity": "high",
+      "threshold": 15,
+      "window_seconds": 300
+    },
+    {
+      "category": "network",
+      "distinct_by": "dst_ip",
+      "group_by": "src_ip",
+      "id": "wd-horizontal-scan",
+      "match_when": {
+        "event_type": "network"
+      },
+      "mitre": [
+        "T1046"
+      ],
+      "name": "One source touching many distinct destinations",
+      "severity": "medium",
+      "threshold": 40,
+      "window_seconds": 120
+    },
+    {
+      "category": "cloud",
+      "group_by": "user",
+      "id": "wd-bulk-object-deletion",
+      "match_when": {
+        "event_type": "delete"
+      },
+      "mitre": [
+        "T1485"
+      ],
+      "name": "Bulk object deletion by one principal",
+      "severity": "high",
+      "threshold": 50,
+      "window_seconds": 300
+    }
+  ]
+}
